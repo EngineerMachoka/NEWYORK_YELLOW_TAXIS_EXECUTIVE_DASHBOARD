@@ -1,0 +1,482 @@
+/* =====================================================================
+   NYC TLC (Yellow) - Contractor-grade SQL layer for Azure SQL Database
+   Includes:
+   - Control tables (download_log, etl_run_log)
+   - Star schema (dim_date, dim_zone, fact_trip)
+   - Staging table (stg_yellow_trip)
+   - Security table for RLS mapping (security_user_borough)
+   - Stored procedures:
+       1) usp_log_download_start
+       2) usp_log_load_complete
+       3) usp_delete_month_refresh (DELETE SQL data for selected month)
+       4) usp_load_month_from_staging (transform + load fact from staging)
+   - BI views:
+       vw_trips_revenue_daily
+       vw_monthly_kpis  (MoM + YoY via LAG)
+   ===================================================================== */
+
+SET NOCOUNT ON;
+GO
+
+/* =========================
+   1) CONTROL / AUDIT TABLES
+   ========================= */
+
+IF OBJECT_ID('dbo.download_log','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.download_log (
+        taxi_type       varchar(10)  NOT NULL,
+        [year]          int          NOT NULL,
+        [month]         int          NOT NULL,
+        file_name       varchar(200) NOT NULL,
+        file_url        varchar(800) NULL,
+        blob_path       varchar(300) NULL,
+        status          varchar(30)  NOT NULL CONSTRAINT DF_download_log_status DEFAULT('downloaded'),
+        downloaded_at   datetime2(0) NOT NULL CONSTRAINT DF_download_log_downloaded_at DEFAULT(sysdatetime()),
+        loaded_at       datetime2(0) NULL,
+        rows_loaded     bigint       NULL,
+        message         varchar(4000) NULL,
+        CONSTRAINT PK_download_log PRIMARY KEY (taxi_type, [year], [month])
+    );
+END
+GO
+
+IF OBJECT_ID('dbo.etl_run_log','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.etl_run_log(
+        run_id          bigint IDENTITY(1,1) PRIMARY KEY,
+        started_at      datetime2(0) NOT NULL CONSTRAINT DF_etl_run_started DEFAULT sysdatetime(),
+        finished_at     datetime2(0) NULL,
+        taxi_type       varchar(10) NULL,
+        [year]          int NULL,
+        [month]         int NULL,
+        status          varchar(30) NOT NULL CONSTRAINT DF_etl_run_status DEFAULT('started'),
+        message         varchar(4000) NULL
+    );
+END
+GO
+
+
+/* =========================
+   2) DIMENSIONS
+   ========================= */
+
+-- Date dimension (YYYYMMDD as key)
+IF OBJECT_ID('dbo.dim_date','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.dim_date(
+        date_key        int NOT NULL PRIMARY KEY,          -- YYYYMMDD
+        [date]          date NOT NULL UNIQUE,
+        [year]          int NOT NULL,
+        [month]         int NOT NULL,
+        day_of_month    int NOT NULL,
+        month_name      varchar(20) NOT NULL,
+        [quarter]       int NOT NULL
+    );
+END
+GO
+
+-- Populate dim_date if empty (adjust range if you want)
+IF NOT EXISTS (SELECT 1 FROM dbo.dim_date)
+BEGIN
+    DECLARE @d date='2018-01-01';
+    WHILE @d <= '2027-12-31'
+    BEGIN
+        INSERT INTO dbo.dim_date(date_key,[date],[year],[month],day_of_month,month_name,[quarter])
+        VALUES (
+            (YEAR(@d)*10000 + MONTH(@d)*100 + DAY(@d)),
+            @d,
+            YEAR(@d),
+            MONTH(@d),
+            DAY(@d),
+            DATENAME(month,@d),
+            DATEPART(quarter,@d)
+        );
+        SET @d = DATEADD(day,1,@d);
+    END
+END
+GO
+
+-- Taxi zone dimension (load via Import Wizard or INSERT statements)
+IF OBJECT_ID('dbo.dim_zone','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.dim_zone(
+        location_id     int NOT NULL PRIMARY KEY,
+        borough         varchar(50) NULL,
+        zone            varchar(80) NULL,
+        service_zone    varchar(50) NULL
+    );
+END
+GO
+
+
+/* =========================
+   3) STAGING + FACT
+   ========================= */
+
+-- Staging table for Yellow trips (subset of common columns)
+-- Add/remove columns if your file schema differs.
+IF OBJECT_ID('dbo.stg_yellow_trip','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.stg_yellow_trip(
+        vendorid                int NULL,
+        tpep_pickup_datetime    datetime2(0) NULL,
+        tpep_dropoff_datetime   datetime2(0) NULL,
+        passenger_count         int NULL,
+        trip_distance           float NULL,
+        ratecodeid              int NULL,
+        store_and_fwd_flag      varchar(1) NULL,
+        pulocationid            int NULL,
+        dolocationid            int NULL,
+        payment_type            int NULL,
+        fare_amount             float NULL,
+        extra                   float NULL,
+        mta_tax                 float NULL,
+        tip_amount              float NULL,
+        tolls_amount            float NULL,
+        improvement_surcharge   float NULL,
+        total_amount            float NULL,
+        congestion_surcharge    float NULL,
+        airport_fee             float NULL,
+
+        -- Load metadata:
+        source_year             int NOT NULL,
+        source_month            int NOT NULL,
+        loaded_at               datetime2(0) NOT NULL CONSTRAINT DF_stg_loaded_at DEFAULT sysdatetime()
+    );
+
+    CREATE INDEX IX_stg_yellow_source ON dbo.stg_yellow_trip(source_year, source_month);
+    CREATE INDEX IX_stg_yellow_pickup ON dbo.stg_yellow_trip(tpep_pickup_datetime);
+END
+GO
+
+-- Fact table (clean + analytics-ready)
+IF OBJECT_ID('dbo.fact_trip','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.fact_trip(
+        trip_id                 bigint IDENTITY(1,1) PRIMARY KEY,
+
+        pickup_date_key         int NOT NULL,
+        dropoff_date_key        int NOT NULL,
+
+        pickup_datetime         datetime2(0) NOT NULL,
+        dropoff_datetime        datetime2(0) NOT NULL,
+
+        pickup_location_id      int NULL,
+        dropoff_location_id     int NULL,
+
+        passenger_count         int NULL,
+        trip_distance           float NULL,
+        payment_type            int NULL,
+
+        fare_amount             float NULL,
+        tip_amount              float NULL,
+        total_amount            float NULL,
+
+        trip_duration_seconds   int NULL,
+        fare_per_mile           float NULL,
+
+        source_year             int NOT NULL,
+        source_month            int NOT NULL,
+
+        created_at              datetime2(0) NOT NULL CONSTRAINT DF_fact_created_at DEFAULT sysdatetime()
+    );
+
+    CREATE INDEX IX_fact_source_month ON dbo.fact_trip(source_year, source_month);
+    CREATE INDEX IX_fact_pickup_date ON dbo.fact_trip(pickup_date_key);
+    CREATE INDEX IX_fact_pickup_loc ON dbo.fact_trip(pickup_location_id);
+END
+GO
+
+
+/* =========================
+   4) SECURITY (for RLS mapping)
+   ========================= */
+
+IF OBJECT_ID('dbo.security_user_borough','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.security_user_borough(
+        user_email  varchar(200) NOT NULL,
+        borough     varchar(50)  NOT NULL,
+        CONSTRAINT PK_security_user_borough PRIMARY KEY(user_email, borough)
+    );
+END
+GO
+
+
+/* =========================
+   5) STORED PROCEDURES
+   ========================= */
+
+-- (A) Upsert "download started/refreshed" record
+CREATE OR ALTER PROCEDURE dbo.usp_log_download_start
+    @taxi_type   varchar(10),
+    @year        int,
+    @month       int,
+    @file_name   varchar(200),
+    @file_url    varchar(800) = NULL,
+    @blob_path   varchar(300) = NULL,
+    @status      varchar(30)  = 'downloaded',
+    @message     varchar(4000)= NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    MERGE dbo.download_log AS t
+    USING (SELECT @taxi_type AS taxi_type, @year AS [year], @month AS [month]) AS s
+    ON (t.taxi_type=s.taxi_type AND t.[year]=s.[year] AND t.[month]=s.[month])
+    WHEN MATCHED THEN
+        UPDATE SET
+            file_name     = @file_name,
+            file_url      = @file_url,
+            blob_path     = @blob_path,
+            status        = @status,
+            downloaded_at = sysdatetime(),
+            message       = @message
+    WHEN NOT MATCHED THEN
+        INSERT (taxi_type,[year],[month],file_name,file_url,blob_path,status,downloaded_at,message)
+        VALUES (@taxi_type,@year,@month,@file_name,@file_url,@blob_path,@status,sysdatetime(),@message);
+END
+GO
+
+
+-- (B) Mark load complete (rows_loaded + loaded_at)
+CREATE OR ALTER PROCEDURE dbo.usp_log_load_complete
+    @taxi_type    varchar(10),
+    @year         int,
+    @month        int,
+    @rows_loaded  bigint,
+    @status       varchar(30) = 'loaded',
+    @message      varchar(4000)= NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE dbo.download_log
+    SET
+        status      = @status,
+        loaded_at   = sysdatetime(),
+        rows_loaded = @rows_loaded,
+        message     = @message
+    WHERE taxi_type=@taxi_type AND [year]=@year AND [month]=@month;
+END
+GO
+
+
+-- (C) Delete data for a month (used for current-month refresh OR reprocessing)
+-- Deletes from FACT and STAGING for that month.
+CREATE OR ALTER PROCEDURE dbo.usp_delete_month_refresh
+    @taxi_type varchar(10),
+    @year      int,
+    @month     int
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @run_id bigint;
+
+    INSERT INTO dbo.etl_run_log(taxi_type,[year],[month],status,message)
+    VALUES (@taxi_type,@year,@month,'deleting','Deleting staging + fact for month refresh');
+
+    SET @run_id = SCOPE_IDENTITY();
+
+    -- FACT first (FK-safe since no FK constraints here, but safe practice)
+    DELETE FROM dbo.fact_trip
+    WHERE source_year=@year AND source_month=@month;
+
+    -- STAGING
+    IF @taxi_type='yellow'
+    BEGIN
+        DELETE FROM dbo.stg_yellow_trip
+        WHERE source_year=@year AND source_month=@month;
+    END
+
+    UPDATE dbo.etl_run_log
+    SET finished_at=sysdatetime(), status='deleted', message='Delete complete'
+    WHERE run_id=@run_id;
+END
+GO
+
+
+-- (D) Transform+load fact from staging for a selected month
+-- Includes basic data quality filters + derived metrics
+CREATE OR ALTER PROCEDURE dbo.usp_load_month_from_staging
+    @taxi_type varchar(10),
+    @year      int,
+    @month     int
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @run_id bigint;
+
+    INSERT INTO dbo.etl_run_log(taxi_type,[year],[month],status,message)
+    VALUES (@taxi_type,@year,@month,'loading','Loading fact_trip from staging');
+
+    SET @run_id = SCOPE_IDENTITY();
+
+    IF @taxi_type <> 'yellow'
+    BEGIN
+        UPDATE dbo.etl_run_log
+        SET finished_at=sysdatetime(), status='failed', message='Only taxi_type=yellow supported in this script'
+        WHERE run_id=@run_id;
+        THROW 50001, 'Only taxi_type=yellow supported in this script.', 1;
+    END
+
+    /* Important:
+       - We assume staging already contains rows for @year/@month.
+       - This proc loads clean rows into fact_trip.
+       - For current-month refresh: call usp_delete_month_refresh first.
+    */
+
+    INSERT INTO dbo.fact_trip (
+        pickup_date_key,
+        dropoff_date_key,
+        pickup_datetime,
+        dropoff_datetime,
+        pickup_location_id,
+        dropoff_location_id,
+        passenger_count,
+        trip_distance,
+        payment_type,
+        fare_amount,
+        tip_amount,
+        total_amount,
+        trip_duration_seconds,
+        fare_per_mile,
+        source_year,
+        source_month
+    )
+    SELECT
+        (YEAR(s.tpep_pickup_datetime)*10000 + MONTH(s.tpep_pickup_datetime)*100 + DAY(s.tpep_pickup_datetime)) AS pickup_date_key,
+        (YEAR(s.tpep_dropoff_datetime)*10000 + MONTH(s.tpep_dropoff_datetime)*100 + DAY(s.tpep_dropoff_datetime)) AS dropoff_date_key,
+        s.tpep_pickup_datetime AS pickup_datetime,
+        s.tpep_dropoff_datetime AS dropoff_datetime,
+        s.pulocationid AS pickup_location_id,
+        s.dolocationid AS dropoff_location_id,
+        s.passenger_count,
+        s.trip_distance,
+        s.payment_type,
+        s.fare_amount,
+        s.tip_amount,
+        s.total_amount,
+        CASE
+            WHEN s.tpep_pickup_datetime IS NOT NULL AND s.tpep_dropoff_datetime IS NOT NULL
+            THEN DATEDIFF(SECOND, s.tpep_pickup_datetime, s.tpep_dropoff_datetime)
+            ELSE NULL
+        END AS trip_duration_seconds,
+        CASE
+            WHEN s.trip_distance IS NOT NULL AND s.trip_distance > 0 AND s.total_amount IS NOT NULL
+            THEN (s.total_amount * 1.0) / NULLIF(s.trip_distance,0)
+            ELSE NULL
+        END AS fare_per_mile,
+        s.source_year,
+        s.source_month
+    FROM dbo.stg_yellow_trip s
+    WHERE
+        s.source_year=@year AND s.source_month=@month
+        AND s.tpep_pickup_datetime IS NOT NULL
+        AND s.tpep_dropoff_datetime IS NOT NULL
+        AND s.tpep_dropoff_datetime >= s.tpep_pickup_datetime
+        AND (s.trip_distance IS NULL OR s.trip_distance >= 0)
+        AND (s.total_amount IS NULL OR s.total_amount >= 0);
+
+    DECLARE @rows bigint = @@ROWCOUNT;
+
+    UPDATE dbo.etl_run_log
+    SET finished_at=sysdatetime(), status='loaded', message=CONCAT('Loaded rows: ', @rows)
+    WHERE run_id=@run_id;
+
+    EXEC dbo.usp_log_load_complete
+        @taxi_type=@taxi_type,
+        @year=@year,
+        @month=@month,
+        @rows_loaded=@rows,
+        @status='loaded',
+        @message='Load complete';
+END
+GO
+
+
+/* =========================
+   6) BI VIEWS (Power BI should connect to views)
+   ========================= */
+
+-- Daily trips + revenue by borough
+CREATE OR ALTER VIEW dbo.vw_trips_revenue_daily AS
+SELECT
+    d.[date],
+    z.borough,
+    COUNT_BIG(*) AS trips,
+    SUM(COALESCE(f.total_amount,0)) AS total_revenue,
+    AVG(COALESCE(f.trip_distance,0)) AS avg_distance,
+    AVG(COALESCE(f.trip_duration_seconds,0)) AS avg_duration_seconds
+FROM dbo.fact_trip f
+JOIN dbo.dim_date d ON d.date_key = f.pickup_date_key
+LEFT JOIN dbo.dim_zone z ON z.location_id = f.pickup_location_id
+GROUP BY d.[date], z.borough;
+GO
+
+-- Monthly KPIs with MoM and YoY (LAG window functions)
+CREATE OR ALTER VIEW dbo.vw_monthly_kpis AS
+WITH m AS (
+    SELECT
+        d.[year],
+        d.[month],
+        DATEFROMPARTS(d.[year], d.[month], 1) AS month_start,
+        z.borough,
+        COUNT_BIG(*) AS trips,
+        SUM(COALESCE(f.total_amount,0)) AS revenue
+    FROM dbo.fact_trip f
+    JOIN dbo.dim_date d ON d.date_key = f.pickup_date_key
+    LEFT JOIN dbo.dim_zone z ON z.location_id = f.pickup_location_id
+    GROUP BY d.[year], d.[month], z.borough
+)
+SELECT
+    [year],[month],month_start,borough,trips,revenue,
+
+    -- MoM %
+    (trips - LAG(trips,1) OVER (PARTITION BY borough ORDER BY month_start))
+        * 1.0 / NULLIF(LAG(trips,1) OVER (PARTITION BY borough ORDER BY month_start),0) AS trips_mom_pct,
+
+    (revenue - LAG(revenue,1) OVER (PARTITION BY borough ORDER BY month_start))
+        * 1.0 / NULLIF(LAG(revenue,1) OVER (PARTITION BY borough ORDER BY month_start),0) AS revenue_mom_pct,
+
+    -- YoY %
+    (trips - LAG(trips,12) OVER (PARTITION BY borough ORDER BY month_start))
+        * 1.0 / NULLIF(LAG(trips,12) OVER (PARTITION BY borough ORDER BY month_start),0) AS trips_yoy_pct,
+
+    (revenue - LAG(revenue,12) OVER (PARTITION BY borough ORDER BY month_start))
+        * 1.0 / NULLIF(LAG(revenue,12) OVER (PARTITION BY borough ORDER BY month_start),0) AS revenue_yoy_pct
+FROM m;
+GO
+
+
+/* =========================
+   7) QUICK TEST QUERIES (optional)
+   ========================= */
+
+-- See what months are loaded:
+-- SELECT * FROM dbo.download_log ORDER BY [year] DESC, [month] DESC;
+
+-- Validate monthly KPIs:
+-- SELECT TOP 100 * FROM dbo.vw_monthly_kpis ORDER BY month_start DESC, borough;
+
+-- Validate daily:
+-- SELECT TOP 100 * FROM dbo.vw_trips_revenue_daily ORDER BY [date] DESC, borough;
+
+
+/* =========================
+   8) HOW TO USE THIS (sequence)
+   =========================
+   Historical month (first time):
+     1) Load file rows into dbo.stg_yellow_trip with source_year/source_month populated
+     2) EXEC dbo.usp_log_download_start @taxi_type='yellow', @year=2025, @month=1, ...
+     3) EXEC dbo.usp_load_month_from_staging @taxi_type='yellow', @year=2025, @month=1
+
+   Current month refresh:
+     1) EXEC dbo.usp_delete_month_refresh @taxi_type='yellow', @year=2026, @month=1
+     2) Re-load staging for that month (fresh file)
+     3) EXEC dbo.usp_log_download_start ... (status='refreshed' optional)
+     4) EXEC dbo.usp_load_month_from_staging ...
+   ========================= */
